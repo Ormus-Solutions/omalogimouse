@@ -1,7 +1,6 @@
 pragma ComponentBehavior: Bound
 
 import QtQuick
-import QtQuick.Controls
 import QtQuick.Layouts
 import Quickshell
 import Quickshell.Io
@@ -83,14 +82,10 @@ Panel {
         anchors.fill: parent
         contentWidth: width
         contentHeight: column.implicitHeight
-        clip: true
+        clip: false
         boundsBehavior: Flickable.StopAtBounds
-        interactive: true
+        interactive: contentHeight > height
         flickableDirection: Flickable.VerticalFlick
-        ScrollBar.vertical: ScrollBar {
-          policy: ScrollBar.AlwaysOn
-          width: Style.space(6)
-        }
 
         Column {
           id: column
