@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "omalogimouse",
+  "name": "Omalogimouse",
+  "version": "1.0.0",
+  "author": "Ormus",
+  "license": "MIT",
+  "description": "Omalogimouse: battery, DPI, MagSpeed, acceleration, and button actions for Logitech MX Master mice on the Omarchy bar.",
+  "kinds": ["service", "bar-widget"],
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Omalogimouse",
+    "description": "Logitech MX Master battery, acceleration, and button binds",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
