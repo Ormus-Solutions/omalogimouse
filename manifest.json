@@ -3,7 +3,7 @@
   "id": "omalogimouse",
   "name": "Omalogimouse",
   "version": "1.0.0",
-  "author": "Ormus",
+  "author": "Ormus Solutions",
   "license": "MIT",
   "description": "Omalogimouse: battery, DPI, MagSpeed, acceleration, and button actions for Logitech MX Master mice on the Omarchy bar.",
   "kinds": ["service", "bar-widget"],

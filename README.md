@@ -1,17 +1,23 @@
 # Omalogimouse
 
-Bar widget and panel for Logitech MX Master mice on [Omarchy](https://omarchy.org):
-original, 2S, 3, 3S, and 4 (including for Mac / for Business name variants).
+An [Ormus](https://ormus.solutions) plugin for [Omarchy](https://omarchy.org).
+
+Bar widget and panel for Logitech MX Master mice: original, 2S, 3, 3S, and 4
+(including for Mac / for Business name variants).
 
 It talks HID++ through Solaar's Python library. The Solaar GUI is not started.
 Controls a given model does not expose stay hidden.
 
 No sudo or pkexec is required.
 
+<p align="center">
+  <img src="preview.png" width="410" alt="Omalogimouse panel on Omarchy: Mouse tab with acceleration, MagSpeed, DPI, SmartShift, and haptic">
+</p>
+
 ## Install
 
 ```bash
-omarchy plugin add https://github.com/HermeticOrmus/omalogimouse.git --enable
+omarchy plugin add https://github.com/Ormus-Solutions/omalogimouse.git --enable
 ```
 
 The widget lands on the right of the bar. Move it with:
@@ -77,3 +83,5 @@ actions are stored only after you pick them on the Keybinds tab.
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+Copyright Ormus Solutions — [ormus.solutions](https://ormus.solutions)
