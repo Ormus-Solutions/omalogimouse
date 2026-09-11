@@ -11,7 +11,12 @@ Controls a given model does not expose stay hidden.
 No sudo or pkexec is required.
 
 <p align="center">
-  <img src="preview.png" width="410" alt="Omalogimouse panel on Omarchy: Mouse tab with acceleration, MagSpeed, DPI, SmartShift, and haptic">
+  <img src="preview.png" width="820" alt="Omalogimouse on Omarchy: Mouse tab and Keybinds tab">
+</p>
+
+<p align="center">
+  <img src="preview-mouse.png" width="320" alt="Mouse tab: acceleration, MagSpeed, DPI, SmartShift, haptic">
+  <img src="preview-keybinds.png" width="320" alt="Keybinds tab: per-button actions for extra MX Master keys">
 </p>
 
 ## Install
