@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import select
 import stat
 import struct
 import subprocess
@@ -67,7 +68,6 @@ MAX_PROC_BYTES = 64 * 1024
 PROC_TIMEOUT_SEC = 5
 LISTEN_MAX_SEC = 6 * 3600
 LISTEN_MAX_STDOUT = 256 * 1024
-ALLOWED_BIN_ROOTS = (Path("/usr/bin"), Path("/bin"))
 _stdout_sent = 0
 
 
@@ -93,96 +93,81 @@ def _closed_env() -> dict[str, str]:
     return env
 
 
-def verified_bin(name: str) -> Path:
-    path = Path("/usr/bin") / name
-    try:
-        st = os.lstat(path)
-    except OSError as exc:
-        fail(f"missing {path}: {exc}")
-    resolved = path
-    if stat.S_ISLNK(st.st_mode):
-        resolved = Path(os.path.realpath(path))
-        if resolved.parent not in ALLOWED_BIN_ROOTS:
-            fail(f"{path} symlink escapes /usr/bin")
-        st = os.stat(resolved)
-    if not stat.S_ISREG(st.st_mode) or st.st_uid != 0 or not os.access(resolved, os.X_OK):
-        fail(f"{resolved} is not a root-owned executable")
-    return resolved
+class VerifiedExec:
+    """Keep a verified executable fd and run it via /proc/self/fd so the
+    checked inode is the one that executes."""
+
+    def __init__(self, abs_path: str, *, owner: int) -> None:
+        self.fd = os.open(abs_path, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            st = os.fstat(self.fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_uid != owner:
+                raise OSError(f"{abs_path} is not an owner-matched regular file")
+            if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+                raise OSError(f"{abs_path} is group/other-writable")
+            if not (st.st_mode & stat.S_IXUSR):
+                raise OSError(f"{abs_path} is not executable")
+        except OSError:
+            os.close(self.fd)
+            raise
+
+    def argv(self, extra: list[str]) -> list[str]:
+        return [f"/proc/self/fd/{self.fd}", *extra]
 
 
-def verified_user_bin(name: str) -> Path | None:
-    path = Path.home() / ".local" / "bin" / name
-    try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
-    except OSError:
-        return None
-    try:
-        st = os.fstat(fd)
-        if st.st_uid != os.getuid() or not stat.S_ISREG(st.st_mode):
-            return None
-        if not os.access(path, os.X_OK):
-            return None
-        return path
-    finally:
-        os.close(fd)
+def _reject_dir_stat(st: os.stat_result, uid: int) -> None:
+    if not stat.S_ISDIR(st.st_mode):
+        raise OSError("not a directory")
+    if st.st_uid not in (0, uid):
+        raise OSError("unowned directory")
+    if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise OSError("group/other-writable directory")
 
 
-HYPRCTL = verified_bin("hyprctl")
-OMARCHY = verified_bin("omarchy")
-OMARCHY_SHELL = verified_bin("omarchy-shell")
-
-
-def run_tool(argv: list[str], *, timeout: int = PROC_TIMEOUT_SEC) -> str:
-    try:
-        completed = subprocess.run(
-            argv,
-            check=False,
-            capture_output=True,
-            timeout=timeout,
-            env=_closed_env(),
-            start_new_session=True,
-        )
-    except subprocess.TimeoutExpired as exc:
-        if exc.stdout:
-            del exc.stdout
-        return ""
-    out = completed.stdout or b""
-    if len(out) > MAX_PROC_BYTES:
-        out = out[:MAX_PROC_BYTES]
-    return out.decode("utf-8", errors="replace")
-
-
-def _refuse_symlink(path: Path) -> None:
-    try:
-        st = os.lstat(path)
-    except FileNotFoundError:
-        return
-    if stat.S_ISLNK(st.st_mode):
-        raise OSError(f"refusing symlink {path}")
-
-
-def _assert_safe_ancestors(path: Path) -> None:
+def open_parent_dirfd(path: Path) -> int:
+    """Walk from / with O_NOFOLLOW|O_DIRECTORY and return a dir fd of path.parent."""
     uid = os.getuid()
-    home = Path.home()
-    current = Path(os.path.abspath(path)).parent
-    for ancestor in [current, *current.parents]:
-        st = os.lstat(ancestor)
-        if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
-            raise OSError(f"unsafe ancestor {ancestor}")
-        if ancestor in (Path("/"), Path("/home"), Path("/usr"), Path("/etc")):
-            continue
-        if ancestor == home:
-            if st.st_uid != uid:
-                raise OSError("HOME is not owned by the user")
-            return
-        if st.st_uid not in (0, uid):
-            raise OSError(f"unowned ancestor {ancestor}")
+    abs_path = Path(os.path.abspath(path))
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for part in abs_path.parent.parts[1:]:
+            nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = nxt
+            _reject_dir_stat(os.fstat(fd), uid)
+        return fd
+    except OSError:
+        os.close(fd)
+        raise
+
+
+def ensure_owned_dir(path: Path, mode: int = 0o700) -> int:
+    uid = os.getuid()
+    abs_path = Path(os.path.abspath(path))
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for part in abs_path.parts[1:]:
+            try:
+                nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            except FileNotFoundError:
+                os.mkdir(part, mode, dir_fd=fd)
+                nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = nxt
+            _reject_dir_stat(os.fstat(fd), uid)
+        return fd
+    except OSError:
+        os.close(fd)
+        raise
 
 
 def read_bounded(path: Path, max_bytes: int) -> bytes:
-    _assert_safe_ancestors(path)
-    _refuse_symlink(path)
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    path = Path(os.path.abspath(path))
+    dir_fd = open_parent_dirfd(path)
+    try:
+        fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd)
+    finally:
+        os.close(dir_fd)
     try:
         st = os.fstat(fd)
         if st.st_uid not in (0, os.getuid()) or not stat.S_ISREG(st.st_mode):
@@ -201,10 +186,7 @@ def atomic_write(path: Path, data: bytes, *, mode: int = 0o600) -> None:
     if len(data) > MAX_LUA_BYTES:
         raise OSError("write too large")
     path = Path(os.path.abspath(path))
-    _assert_safe_ancestors(path)
-    _refuse_symlink(path)
-    parent = path.parent
-    dir_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    dir_fd = open_parent_dirfd(path)
     tmp_name = f".{path.name}.{os.getpid()}.tmp"
     fd = -1
     try:
@@ -228,6 +210,130 @@ def atomic_write(path: Path, data: bytes, *, mode: int = 0o600) -> None:
         raise
     finally:
         os.close(dir_fd)
+
+
+def backup_if_absent(path: Path, original: bytes) -> None:
+    path = Path(os.path.abspath(path))
+    dir_fd = open_parent_dirfd(path)
+    fd = -1
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+        fd = os.open(path.name, flags, 0o644, dir_fd=dir_fd)
+        written = 0
+        while written < len(original):
+            written += os.write(fd, original[written:])
+        os.fsync(fd)
+    except FileExistsError:
+        return
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        os.close(dir_fd)
+
+
+class _CappedStderr:
+    def __init__(self, raw: Any, limit: int) -> None:
+        self.raw = raw
+        self.limit = limit
+        self.n = 0
+
+    def write(self, data: str) -> int:
+        encoded = data.encode("utf-8", errors="replace") if isinstance(data, str) else data
+        if self.n >= self.limit:
+            return len(data)
+        take = encoded[: self.limit - self.n]
+        self.raw.write(take)
+        self.n += len(take)
+        return len(data)
+
+    def flush(self) -> None:
+        self.raw.flush()
+
+
+def _cap_stderr() -> None:
+    sys.stderr = _CappedStderr(sys.stderr.buffer, 4096)  # type: ignore[assignment]
+
+
+def run_tool(exe: VerifiedExec, extra: list[str], *, timeout: int = PROC_TIMEOUT_SEC) -> str:
+    proc = subprocess.Popen(
+        exe.argv(extra),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        env=_closed_env(),
+        start_new_session=True,
+        pass_fds=(exe.fd,),
+    )
+    buf = bytearray()
+    assert proc.stdout is not None
+    fd = proc.stdout.fileno()
+    deadline = time.monotonic() + timeout
+    try:
+        while time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
+            ready, _, _ = select.select([proc.stdout], [], [], remaining)
+            if not ready:
+                break
+            chunk = os.read(fd, 4096)
+            if not chunk:
+                break
+            buf.extend(chunk)
+            if len(buf) > MAX_PROC_BYTES:
+                os.killpg(proc.pid, 9)
+                buf = buf[:MAX_PROC_BYTES]
+                break
+        if proc.poll() is None:
+            os.killpg(proc.pid, 9)
+        proc.wait(timeout=1)
+    except Exception:
+        try:
+            os.killpg(proc.pid, 9)
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=1)
+        except Exception:
+            pass
+    return bytes(buf).decode("utf-8", errors="replace")
+
+
+def verified_user_exec(name: str) -> VerifiedExec | None:
+    path = Path.home() / ".local" / "bin" / name
+    try:
+        dir_fd = open_parent_dirfd(path)
+    except OSError:
+        return None
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dir_fd)
+    except OSError:
+        os.close(dir_fd)
+        return None
+    os.close(dir_fd)
+    try:
+        st = os.fstat(fd)
+        if st.st_uid != os.getuid() or not stat.S_ISREG(st.st_mode):
+            os.close(fd)
+            return None
+        if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            os.close(fd)
+            return None
+        if not (st.st_mode & stat.S_IXUSR):
+            os.close(fd)
+            return None
+        exe = VerifiedExec.__new__(VerifiedExec)
+        exe.fd = fd
+        exe.name = name
+        return exe
+    except OSError:
+        os.close(fd)
+        return None
+
+
+try:
+    HYPRCTL = VerifiedExec("/usr/bin/hyprctl", owner=0)
+    OMARCHY = VerifiedExec("/usr/bin/omarchy", owner=0)
+    OMARCHY_SHELL = VerifiedExec("/usr/bin/omarchy-shell", owner=0)
+except OSError as exc:
+    fail(str(exc))
 
 
 # Wireless PID / Bluetooth ID -> marketing name. Name matching still wins for
@@ -494,24 +600,24 @@ HW_ACTIONS: dict[str, str] = {
 HW_BY_LABEL = {label.lower(): action for action, label in HW_ACTIONS.items()}
 HW_BY_LABEL["haptic"] = "haptic-hw"
 
-def software_actions() -> dict[str, list[str]]:
-    actions = {
-        "workspace-next": [str(HYPRCTL), "dispatch", "workspace", "e+1"],
-        "workspace-prev": [str(HYPRCTL), "dispatch", "workspace", "e-1"],
-        "menu": [str(OMARCHY), "menu", "summon", "root"],
-        "expose": [str(OMARCHY_SHELL), "expose", "toggle"],
-        "volume-up": [str(OMARCHY), "audio", "output", "volume", "raise"],
-        "volume-down": [str(OMARCHY), "audio", "output", "volume", "lower"],
-        "mute": [str(OMARCHY), "audio", "output", "volume", "mute-toggle"],
-        "play-pause": [str(OMARCHY_SHELL), "media", "playPause"],
+def software_actions() -> dict[str, tuple[VerifiedExec, list[str]]]:
+    actions: dict[str, tuple[VerifiedExec, list[str]]] = {
+        "workspace-next": (HYPRCTL, ["dispatch", "workspace", "e+1"]),
+        "workspace-prev": (HYPRCTL, ["dispatch", "workspace", "e-1"]),
+        "menu": (OMARCHY, ["menu", "summon", "root"]),
+        "expose": (OMARCHY_SHELL, ["expose", "toggle"]),
+        "volume-up": (OMARCHY, ["audio", "output", "volume", "raise"]),
+        "volume-down": (OMARCHY, ["audio", "output", "volume", "lower"]),
+        "mute": (OMARCHY, ["audio", "output", "volume", "mute-toggle"]),
+        "play-pause": (OMARCHY_SHELL, ["media", "playPause"]),
     }
-    shot = verified_user_bin("screenshot-region-clipboard")
+    shot = verified_user_exec("screenshot-region-clipboard")
     if shot is not None:
-        actions["screenshot"] = [str(shot)]
+        actions["screenshot"] = (shot, [])
     return actions
 
 
-SOFTWARE_ACTIONS: dict[str, list[str]] = software_actions()
+SOFTWARE_ACTIONS: dict[str, tuple[VerifiedExec, list[str]]] = software_actions()
 
 ACTION_CATALOG: list[dict[str, str]] = [
     {"value": "default", "label": "Default for this button", "kind": "hardware"},
@@ -542,7 +648,8 @@ def binds_file() -> dict[str, Any]:
 
 
 def save_binds(data: dict[str, Any]) -> None:
-    BINDS_PATH.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    dir_fd = ensure_owned_dir(BINDS_PATH.parent, 0o700)
+    os.close(dir_fd)
     payload = (json.dumps(data, indent=2) + "\n").encode("utf-8")
     if len(payload) > MAX_BINDS_BYTES:
         raise OSError("binds file too large")
@@ -702,15 +809,17 @@ def cmd_bind(button: str, action: str, serial: str | None) -> None:
 
 
 def fire_action(action: str) -> None:
-    cmd = SOFTWARE_ACTIONS.get(action)
-    if not cmd:
+    spec = SOFTWARE_ACTIONS.get(action)
+    if not spec:
         return
+    exe, extra = spec
     try:
         subprocess.Popen(
-            cmd,
+            exe.argv(extra),
             env=_closed_env(),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            pass_fds=(exe.fd,),
         )
     except OSError as exc:
         logger.error("action %s failed: %s", action, exc)
@@ -812,7 +921,7 @@ ACCEL_END = "-- omalogimouse:end"
 
 def hypr_mouse_names() -> list[str]:
     try:
-        raw = run_tool([str(HYPRCTL), "devices", "-j"])
+        raw = run_tool(HYPRCTL, ["devices", "-j"])
         data = json.loads(raw) if raw else {}
     except (OSError, json.JSONDecodeError):
         return []
@@ -866,10 +975,7 @@ def write_accel_block(enabled: bool, names: list[str]) -> None:
             text += "\n"
         text += "\n" + block
     backup = INPUT_LUA.with_name(INPUT_LUA.name + ".bak.omalogimouse")
-    try:
-        os.lstat(backup)
-    except FileNotFoundError:
-        atomic_write(backup, original)
+    backup_if_absent(backup, original)
     atomic_write(INPUT_LUA, text.encode("utf-8"), mode=0o644)
     errors = reload_hypr()
     if errors:
@@ -879,8 +985,8 @@ def write_accel_block(enabled: bool, names: list[str]) -> None:
 
 
 def reload_hypr() -> str:
-    run_tool([str(HYPRCTL), "reload"], timeout=8)
-    return run_tool([str(HYPRCTL), "configerrors"], timeout=5).strip()
+    run_tool(HYPRCTL, ["reload"], timeout=8)
+    return run_tool(HYPRCTL, ["configerrors"], timeout=5).strip()
 
 
 def cmd_accel(value: str, serial: str | None) -> None:
@@ -972,6 +1078,7 @@ def parse_args(argv: list[str]) -> tuple[list[str], str | None]:
 
 
 def main(argv: list[str]) -> None:
+    _cap_stderr()
     args, serial = parse_args(argv[1:])
     if not args or args[0] in {"-h", "--help"}:
         fail(

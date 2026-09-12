@@ -155,8 +155,14 @@ Item {
     if (connected && hasButtons && !listenProc.running) startListen()
   }
 
+  property string statusLine: ""
+  property string statusErrLine: ""
+  property string actionLine: ""
+  property string actionErrLine: ""
+  property int listenBytes: 0
+
   function runHelper(args) {
-    var cmd = ["/usr/bin/timeout", "-s", "KILL", "8", "/usr/bin/python3", "-I", helperPath]
+    var cmd = ["/usr/bin/timeout", "-s", "KILL", "8", "/usr/bin/python3.14", "-I", helperPath]
     if (pinDevice && selectedSerial !== "") {
       cmd.push("--device")
       cmd.push(selectedSerial)
@@ -238,7 +244,8 @@ Item {
   function startListen() {
     if (listenProc.running) listenProc.running = false
     if (!connected || !hasButtons) return
-    var cmd = ["/usr/bin/timeout", "-s", "KILL", "21600", "/usr/bin/python3", "-I", helperPath]
+    listenBytes = 0
+    var cmd = ["/usr/bin/timeout", "-s", "KILL", "21600", "/usr/bin/python3.14", "-I", helperPath]
     if (pinDevice && selectedSerial !== "") {
       cmd.push("--device")
       cmd.push(selectedSerial)
@@ -260,20 +267,22 @@ Item {
     id: statusProc
     running: false
     command: []
-    stdout: StdioCollector {
-      id: statusOut
-      waitForEnd: true
+    stdout: SplitParser {
+      onRead: function(line) {
+        if (line.length > 65536) { statusProc.running = false; return }
+        root.statusLine = line
+      }
     }
-    stderr: StdioCollector {
-      id: statusErr
-      waitForEnd: true
+    stderr: SplitParser {
+      onRead: function(line) {
+        if (line.length > 256) return
+        root.statusErrLine = line
+      }
     }
     onExited: function(exitCode) {
       root.refreshing = false
-      var stdout = root.capText(statusOut.text, 65536)
-      var stderr = root.capText(statusErr.text, 4096)
-      if (exitCode === 0) root.applyStatus(stdout)
-      else root.lastError = stderr || stdout || "Could not read mouse"
+      if (exitCode === 0) root.applyStatus(root.statusLine)
+      else root.lastError = root.statusErrLine || root.statusLine || "Could not read mouse"
     }
   }
 
@@ -281,25 +290,27 @@ Item {
     id: actionProc
     running: false
     command: []
-    stdout: StdioCollector {
-      id: actionOut
-      waitForEnd: true
+    stdout: SplitParser {
+      onRead: function(line) {
+        if (line.length > 65536) { actionProc.running = false; return }
+        root.actionLine = line
+      }
     }
-    stderr: StdioCollector {
-      id: actionErr
-      waitForEnd: true
+    stderr: SplitParser {
+      onRead: function(line) {
+        if (line.length > 256) return
+        root.actionErrLine = line
+      }
     }
     onExited: function(exitCode) {
-      var stdout = root.capText(actionOut.text, 65536)
-      var stderr = root.capText(actionErr.text, 4096)
       if (exitCode === 0) {
-        root.applyStatus(stdout)
+        root.applyStatus(root.actionLine)
         var cmd = actionProc.command || []
         for (var i = 0; i < cmd.length; i++) {
           if (cmd[i] === "bind") { root.startListen(); break }
         }
       } else {
-        root.lastError = stderr || stdout || "Mouse command failed"
+        root.lastError = root.actionErrLine || root.actionLine || "Mouse command failed"
       }
     }
   }
@@ -309,7 +320,10 @@ Item {
     running: false
     command: []
     stdout: SplitParser {
-      onRead: function(line) { }
+      onRead: function(line) {
+        root.listenBytes += line.length
+        if (root.listenBytes > 262144) listenProc.running = false
+      }
     }
   }
 }
