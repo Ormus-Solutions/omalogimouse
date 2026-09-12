@@ -157,9 +157,59 @@ Item {
 
   property string statusLine: ""
   property string statusErrLine: ""
+  property int statusBytes: 0
   property string actionLine: ""
   property string actionErrLine: ""
+  property int actionBytes: 0
   property int listenBytes: 0
+  readonly property var helperEnvironment: ({
+    "PATH": "/usr/bin:/bin",
+    "HOME": Quickshell.env("HOME") || "",
+    "USER": Quickshell.env("USER") || "",
+    "LOGNAME": Quickshell.env("LOGNAME") || "",
+    "XDG_RUNTIME_DIR": Quickshell.env("XDG_RUNTIME_DIR") || "",
+    "XDG_CONFIG_HOME": Quickshell.env("XDG_CONFIG_HOME") || "",
+    "XDG_STATE_HOME": Quickshell.env("XDG_STATE_HOME") || "",
+    "HYPRLAND_INSTANCE_SIGNATURE": Quickshell.env("HYPRLAND_INSTANCE_SIGNATURE") || "",
+    "WAYLAND_DISPLAY": Quickshell.env("WAYLAND_DISPLAY") || "",
+    "XDG_SESSION_TYPE": Quickshell.env("XDG_SESSION_TYPE") || "",
+    "XDG_CURRENT_DESKTOP": Quickshell.env("XDG_CURRENT_DESKTOP") || "",
+    "DBUS_SESSION_BUS_ADDRESS": Quickshell.env("DBUS_SESSION_BUS_ADDRESS") || "",
+    "LANG": Quickshell.env("LANG") || "C",
+    "PYTHONDONTWRITEBYTECODE": "1"
+  })
+
+  function accountChunk(proc, which, data, maxBytes) {
+    var n = data.length
+    if (which === "status") {
+      if (root.statusBytes + n > maxBytes) { proc.signal(9); proc.running = false; return false }
+      root.statusBytes += n
+      root.statusLine += data
+      return true
+    }
+    if (which === "statusErr") {
+      if (root.statusErrLine.length + n > 4096) return false
+      root.statusErrLine += data
+      return true
+    }
+    if (which === "action") {
+      if (root.actionBytes + n > maxBytes) { proc.signal(9); proc.running = false; return false }
+      root.actionBytes += n
+      root.actionLine += data
+      return true
+    }
+    if (which === "actionErr") {
+      if (root.actionErrLine.length + n > 4096) return false
+      root.actionErrLine += data
+      return true
+    }
+    if (which === "listen") {
+      if (root.listenBytes + n > maxBytes) { proc.signal(9); proc.running = false; return false }
+      root.listenBytes += n
+      return true
+    }
+    return false
+  }
 
   function runHelper(args) {
     var cmd = ["/usr/bin/timeout", "-s", "KILL", "8", "/usr/bin/python3.14", "-I", helperPath]
@@ -180,6 +230,9 @@ Item {
   function refresh() {
     if (statusProc.running) return
     refreshing = true
+    statusLine = ""
+    statusErrLine = ""
+    statusBytes = 0
     statusProc.command = runHelper(["status"])
     statusProc.running = true
   }
@@ -187,6 +240,9 @@ Item {
   function setSetting(name, value) {
     if (actionProc.running) return
     lastError = ""
+    actionLine = ""
+    actionErrLine = ""
+    actionBytes = 0
     actionProc.command = runHelper(["set", name, String(value)])
     actionProc.running = true
   }
@@ -209,6 +265,9 @@ Item {
     if (actionProc.running) return
     acceleration = on === true
     lastError = ""
+    actionLine = ""
+    actionErrLine = ""
+    actionBytes = 0
     actionProc.command = runHelper(["accel", acceleration ? "on" : "off"])
     actionProc.running = true
   }
@@ -230,6 +289,9 @@ Item {
 
   function playHaptic() {
     if (actionProc.running || !hasHaptic) return
+    actionLine = ""
+    actionErrLine = ""
+    actionBytes = 0
     actionProc.command = runHelper(["play", "SHARP STATE CHANGE"])
     actionProc.running = true
   }
@@ -237,6 +299,9 @@ Item {
   function setButton(name, action) {
     if (actionProc.running) return
     lastError = ""
+    actionLine = ""
+    actionErrLine = ""
+    actionBytes = 0
     actionProc.command = runHelper(["bind", String(name), String(action)])
     actionProc.running = true
   }
@@ -267,17 +332,15 @@ Item {
     id: statusProc
     running: false
     command: []
+    clearEnvironment: true
+    environment: root.helperEnvironment
     stdout: SplitParser {
-      onRead: function(line) {
-        if (line.length > 65536) { statusProc.running = false; return }
-        root.statusLine = line
-      }
+      splitMarker: ""
+      onRead: function(data) { root.accountChunk(statusProc, "status", data, 65536) }
     }
     stderr: SplitParser {
-      onRead: function(line) {
-        if (line.length > 256) return
-        root.statusErrLine = line
-      }
+      splitMarker: ""
+      onRead: function(data) { root.accountChunk(statusProc, "statusErr", data, 4096) }
     }
     onExited: function(exitCode) {
       root.refreshing = false
@@ -290,17 +353,15 @@ Item {
     id: actionProc
     running: false
     command: []
+    clearEnvironment: true
+    environment: root.helperEnvironment
     stdout: SplitParser {
-      onRead: function(line) {
-        if (line.length > 65536) { actionProc.running = false; return }
-        root.actionLine = line
-      }
+      splitMarker: ""
+      onRead: function(data) { root.accountChunk(actionProc, "action", data, 65536) }
     }
     stderr: SplitParser {
-      onRead: function(line) {
-        if (line.length > 256) return
-        root.actionErrLine = line
-      }
+      splitMarker: ""
+      onRead: function(data) { root.accountChunk(actionProc, "actionErr", data, 4096) }
     }
     onExited: function(exitCode) {
       if (exitCode === 0) {
@@ -319,11 +380,11 @@ Item {
     id: listenProc
     running: false
     command: []
+    clearEnvironment: true
+    environment: root.helperEnvironment
     stdout: SplitParser {
-      onRead: function(line) {
-        root.listenBytes += line.length
-        if (root.listenBytes > 262144) listenProc.running = false
-      }
+      splitMarker: ""
+      onRead: function(data) { root.accountChunk(listenProc, "listen", data, 262144) }
     }
   }
 }
