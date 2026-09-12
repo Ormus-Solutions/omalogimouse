@@ -72,14 +72,18 @@ HID++ owner at a time.
 All helper commands use a fixed argument list. Nothing is interpolated into a
 shell string. Nothing elevates privileges.
 
-- `python3 mx.py` — HID++ status, settings, binds, and the diverted-key listener
-- `timeout` — caps each helper run
-- `hyprctl devices -j` — find the MX Master pointer for acceleration
-- `hyprctl reload` and `hyprctl configerrors` — apply acceleration after you
-  toggle it in the panel
-- Optional bind actions you pick on the Keybinds tab, for example
-  `hyprctl dispatch workspace e+1`, `omarchy menu summon root`,
-  `omarchy audio output volume raise`
+- `/usr/bin/python3 -I mx.py` — isolated interpreter, HID++ status/settings/binds
+- `/usr/bin/timeout` — 8s on status/actions, 6h on the diverted-key listener
+- `/usr/bin/hyprctl` — devices, reload, and configerrors after an acceleration
+  toggle; output is time- and byte-capped
+- `/usr/bin/omarchy` and `/usr/bin/omarchy-shell` — only for Keybinds actions
+  you pick (menu, volume, Exposé, play/pause)
+- Optional `~/.local/bin/screenshot-region-clipboard` if it is a user-owned
+  regular file (no symlink)
+
+Child processes use a closed environment (`PATH=/usr/bin:/bin`, no `PYTHONPATH`).
+Config and binds writes are no-follow, size-capped, and replaced atomically.
+A failed Hyprland reload rolls `input.lua` back.
 
 The plugin opens no network sockets and downloads nothing. Acceleration edits
 `~/.config/hypr/input.lua` only after you click **Mouse acceleration**. Button

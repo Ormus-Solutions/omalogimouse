@@ -3,9 +3,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import stat
 import struct
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -45,10 +48,186 @@ def fail(message: str, *, code: int = 1) -> None:
 
 
 def emit(payload: dict[str, Any]) -> None:
+    global _stdout_sent
+    line = json.dumps(payload, default=str)
+    encoded = (line + "\n").encode("utf-8")
+    if _stdout_sent + len(encoded) > LISTEN_MAX_STDOUT:
+        raise SystemExit(0)
+    _stdout_sent += len(encoded)
     try:
-        print(json.dumps(payload, default=str), flush=True)
+        sys.stdout.buffer.write(encoded)
+        sys.stdout.buffer.flush()
     except BrokenPipeError:
         raise SystemExit(0) from None
+
+
+MAX_BINDS_BYTES = 64 * 1024
+MAX_LUA_BYTES = 1024 * 1024
+MAX_PROC_BYTES = 64 * 1024
+PROC_TIMEOUT_SEC = 5
+LISTEN_MAX_SEC = 6 * 3600
+LISTEN_MAX_STDOUT = 256 * 1024
+ALLOWED_BIN_ROOTS = (Path("/usr/bin"), Path("/bin"))
+_stdout_sent = 0
+
+
+def _closed_env() -> dict[str, str]:
+    keep = (
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "XDG_RUNTIME_DIR",
+        "XDG_CONFIG_HOME",
+        "XDG_STATE_HOME",
+        "HYPRLAND_INSTANCE_SIGNATURE",
+        "WAYLAND_DISPLAY",
+        "XDG_SESSION_TYPE",
+        "XDG_CURRENT_DESKTOP",
+        "DBUS_SESSION_BUS_ADDRESS",
+        "LANG",
+        "LC_ALL",
+    )
+    env = {key: os.environ[key] for key in keep if key in os.environ}
+    env["PATH"] = "/usr/bin:/bin"
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    return env
+
+
+def verified_bin(name: str) -> Path:
+    path = Path("/usr/bin") / name
+    try:
+        st = os.lstat(path)
+    except OSError as exc:
+        fail(f"missing {path}: {exc}")
+    resolved = path
+    if stat.S_ISLNK(st.st_mode):
+        resolved = Path(os.path.realpath(path))
+        if resolved.parent not in ALLOWED_BIN_ROOTS:
+            fail(f"{path} symlink escapes /usr/bin")
+        st = os.stat(resolved)
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != 0 or not os.access(resolved, os.X_OK):
+        fail(f"{resolved} is not a root-owned executable")
+    return resolved
+
+
+def verified_user_bin(name: str) -> Path | None:
+    path = Path.home() / ".local" / "bin" / name
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if st.st_uid != os.getuid() or not stat.S_ISREG(st.st_mode):
+            return None
+        if not os.access(path, os.X_OK):
+            return None
+        return path
+    finally:
+        os.close(fd)
+
+
+HYPRCTL = verified_bin("hyprctl")
+OMARCHY = verified_bin("omarchy")
+OMARCHY_SHELL = verified_bin("omarchy-shell")
+
+
+def run_tool(argv: list[str], *, timeout: int = PROC_TIMEOUT_SEC) -> str:
+    try:
+        completed = subprocess.run(
+            argv,
+            check=False,
+            capture_output=True,
+            timeout=timeout,
+            env=_closed_env(),
+            start_new_session=True,
+        )
+    except subprocess.TimeoutExpired as exc:
+        if exc.stdout:
+            del exc.stdout
+        return ""
+    out = completed.stdout or b""
+    if len(out) > MAX_PROC_BYTES:
+        out = out[:MAX_PROC_BYTES]
+    return out.decode("utf-8", errors="replace")
+
+
+def _refuse_symlink(path: Path) -> None:
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(st.st_mode):
+        raise OSError(f"refusing symlink {path}")
+
+
+def _assert_safe_ancestors(path: Path) -> None:
+    uid = os.getuid()
+    home = Path.home()
+    current = Path(os.path.abspath(path)).parent
+    for ancestor in [current, *current.parents]:
+        st = os.lstat(ancestor)
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+            raise OSError(f"unsafe ancestor {ancestor}")
+        if ancestor in (Path("/"), Path("/home"), Path("/usr"), Path("/etc")):
+            continue
+        if ancestor == home:
+            if st.st_uid != uid:
+                raise OSError("HOME is not owned by the user")
+            return
+        if st.st_uid not in (0, uid):
+            raise OSError(f"unowned ancestor {ancestor}")
+
+
+def read_bounded(path: Path, max_bytes: int) -> bytes:
+    _assert_safe_ancestors(path)
+    _refuse_symlink(path)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        st = os.fstat(fd)
+        if st.st_uid not in (0, os.getuid()) or not stat.S_ISREG(st.st_mode):
+            raise OSError(f"refusing {path}")
+        if st.st_size > max_bytes:
+            raise OSError(f"{path} exceeds {max_bytes} bytes")
+        data = os.read(fd, max_bytes + 1)
+        if len(data) > max_bytes:
+            raise OSError(f"{path} exceeds {max_bytes} bytes")
+        return data
+    finally:
+        os.close(fd)
+
+
+def atomic_write(path: Path, data: bytes, *, mode: int = 0o600) -> None:
+    if len(data) > MAX_LUA_BYTES:
+        raise OSError("write too large")
+    path = Path(os.path.abspath(path))
+    _assert_safe_ancestors(path)
+    _refuse_symlink(path)
+    parent = path.parent
+    dir_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    tmp_name = f".{path.name}.{os.getpid()}.tmp"
+    fd = -1
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+        fd = os.open(tmp_name, flags, mode, dir_fd=dir_fd)
+        written = 0
+        while written < len(data):
+            written += os.write(fd, data[written:])
+        os.fsync(fd)
+        os.close(fd)
+        fd = -1
+        os.replace(tmp_name, path.name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        os.fsync(dir_fd)
+    except Exception:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            os.unlink(tmp_name, dir_fd=dir_fd)
+        except OSError:
+            pass
+        raise
+    finally:
+        os.close(dir_fd)
 
 
 # Wireless PID / Bluetooth ID -> marketing name. Name matching still wins for
@@ -315,17 +494,24 @@ HW_ACTIONS: dict[str, str] = {
 HW_BY_LABEL = {label.lower(): action for action, label in HW_ACTIONS.items()}
 HW_BY_LABEL["haptic"] = "haptic-hw"
 
-SOFTWARE_ACTIONS: dict[str, list[str]] = {
-    "workspace-next": ["hyprctl", "dispatch", "workspace", "e+1"],
-    "workspace-prev": ["hyprctl", "dispatch", "workspace", "e-1"],
-    "menu": ["omarchy", "menu", "summon", "root"],
-    "expose": ["omarchy-shell", "expose", "toggle"],
-    "volume-up": ["omarchy", "audio", "output", "volume", "raise"],
-    "volume-down": ["omarchy", "audio", "output", "volume", "lower"],
-    "mute": ["omarchy", "audio", "output", "volume", "mute-toggle"],
-    "play-pause": ["omarchy-shell", "media", "playPause"],
-    "screenshot": ["screenshot-region-clipboard"],
-}
+def software_actions() -> dict[str, list[str]]:
+    actions = {
+        "workspace-next": [str(HYPRCTL), "dispatch", "workspace", "e+1"],
+        "workspace-prev": [str(HYPRCTL), "dispatch", "workspace", "e-1"],
+        "menu": [str(OMARCHY), "menu", "summon", "root"],
+        "expose": [str(OMARCHY_SHELL), "expose", "toggle"],
+        "volume-up": [str(OMARCHY), "audio", "output", "volume", "raise"],
+        "volume-down": [str(OMARCHY), "audio", "output", "volume", "lower"],
+        "mute": [str(OMARCHY), "audio", "output", "volume", "mute-toggle"],
+        "play-pause": [str(OMARCHY_SHELL), "media", "playPause"],
+    }
+    shot = verified_user_bin("screenshot-region-clipboard")
+    if shot is not None:
+        actions["screenshot"] = [str(shot)]
+    return actions
+
+
+SOFTWARE_ACTIONS: dict[str, list[str]] = software_actions()
 
 ACTION_CATALOG: list[dict[str, str]] = [
     {"value": "default", "label": "Default for this button", "kind": "hardware"},
@@ -348,14 +534,19 @@ ACTION_CATALOG: list[dict[str, str]] = [
 
 def binds_file() -> dict[str, Any]:
     try:
-        return json.loads(BINDS_PATH.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        raw = read_bounded(BINDS_PATH, MAX_BINDS_BYTES)
+        parsed = json.loads(raw.decode("utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
         return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def save_binds(data: dict[str, Any]) -> None:
-    BINDS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    BINDS_PATH.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    BINDS_PATH.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    payload = (json.dumps(data, indent=2) + "\n").encode("utf-8")
+    if len(payload) > MAX_BINDS_BYTES:
+        raise OSError("binds file too large")
+    atomic_write(BINDS_PATH, payload)
 
 
 def find_setting(dev: Any, name: str) -> Any | None:
@@ -515,7 +706,12 @@ def fire_action(action: str) -> None:
     if not cmd:
         return
     try:
-        subprocess.Popen(cmd, start_new_session=True)
+        subprocess.Popen(
+            cmd,
+            env=_closed_env(),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
     except OSError as exc:
         logger.error("action %s failed: %s", action, exc)
 
@@ -524,6 +720,11 @@ def cmd_listen(serial: str | None) -> None:
     from logitech_receiver import base
     from logitech_receiver.hidpp20_constants import SupportedFeature
 
+    try:
+        os.setpgrp()
+    except OSError:
+        pass
+    deadline = time.monotonic() + LISTEN_MAX_SEC
     devices = iter_devices()
     mouse = pick_mouse(devices, serial)
     if mouse is None or not mouse.ping():
@@ -554,7 +755,8 @@ def cmd_listen(serial: str | None) -> None:
         feat_index = None
     emit({"ok": True, "listening": True, "serial": serial_id})
     pressed: set[int] = set()
-    while True:
+    events = 0
+    while time.monotonic() < deadline and _stdout_sent < LISTEN_MAX_STDOUT:
         try:
             packet = base.read(handle, 1.0)
         except Exception:
@@ -578,8 +780,15 @@ def cmd_listen(serial: str | None) -> None:
             action = stored.get(button)
             if action in SOFTWARE_ACTIONS:
                 fire_action(action)
+                events += 1
                 emit({"event": "press", "button": button, "action": action})
+                if events >= 10_000:
+                    raise SystemExit(0)
         pressed = cids
+    try:
+        os.killpg(os.getpgrp(), 15)
+    except OSError:
+        pass
 
 
 def coerce_value(setting: Any, text: str) -> Any:
@@ -603,9 +812,9 @@ ACCEL_END = "-- omalogimouse:end"
 
 def hypr_mouse_names() -> list[str]:
     try:
-        raw = subprocess.check_output(["hyprctl", "devices", "-j"], text=True)
-        data = json.loads(raw)
-    except (OSError, json.JSONDecodeError, subprocess.CalledProcessError):
+        raw = run_tool([str(HYPRCTL), "devices", "-j"])
+        data = json.loads(raw) if raw else {}
+    except (OSError, json.JSONDecodeError):
         return []
     names: list[str] = []
     for mouse in data.get("mice") or []:
@@ -622,7 +831,7 @@ def hypr_mouse_names() -> list[str]:
 
 def accel_enabled() -> bool:
     try:
-        text = INPUT_LUA.read_text(encoding="utf-8")
+        text = read_bounded(INPUT_LUA, MAX_LUA_BYTES).decode("utf-8")
     except OSError:
         return True
     start = text.find(ACCEL_BEGIN)
@@ -634,8 +843,7 @@ def accel_enabled() -> bool:
 
 
 def write_accel_block(enabled: bool, names: list[str]) -> None:
-    if not INPUT_LUA.exists():
-        raise FileNotFoundError(str(INPUT_LUA))
+    original = read_bounded(INPUT_LUA, MAX_LUA_BYTES)
     profile = "adaptive" if enabled else "flat"
     lines = [
         ACCEL_BEGIN,
@@ -645,7 +853,7 @@ def write_accel_block(enabled: bool, names: list[str]) -> None:
         lines.append(f'hl.device({{ name = "{name}", accel_profile = "{profile}" }})')
     lines.append(ACCEL_END)
     block = "\n".join(lines) + "\n"
-    text = INPUT_LUA.read_text(encoding="utf-8")
+    text = original.decode("utf-8")
     start = text.find(ACCEL_BEGIN)
     end = text.find(ACCEL_END)
     if start >= 0 and end > start:
@@ -658,18 +866,21 @@ def write_accel_block(enabled: bool, names: list[str]) -> None:
             text += "\n"
         text += "\n" + block
     backup = INPUT_LUA.with_name(INPUT_LUA.name + ".bak.omalogimouse")
-    if not backup.exists():
-        backup.write_text(INPUT_LUA.read_text(encoding="utf-8"), encoding="utf-8")
-    INPUT_LUA.write_text(text, encoding="utf-8")
+    try:
+        os.lstat(backup)
+    except FileNotFoundError:
+        atomic_write(backup, original)
+    atomic_write(INPUT_LUA, text.encode("utf-8"), mode=0o644)
+    errors = reload_hypr()
+    if errors:
+        atomic_write(INPUT_LUA, original, mode=0o644)
+        reload_hypr()
+        raise OSError(errors)
 
 
 def reload_hypr() -> str:
-    subprocess.run(["hyprctl", "reload"], check=False, capture_output=True, text=True)
-    try:
-        errors = subprocess.check_output(["hyprctl", "configerrors"], text=True).strip()
-    except (OSError, subprocess.CalledProcessError) as exc:
-        return str(exc)
-    return errors
+    run_tool([str(HYPRCTL), "reload"], timeout=8)
+    return run_tool([str(HYPRCTL), "configerrors"], timeout=5).strip()
 
 
 def cmd_accel(value: str, serial: str | None) -> None:
@@ -677,10 +888,10 @@ def cmd_accel(value: str, serial: str | None) -> None:
     names = hypr_mouse_names()
     if not names:
         fail("no Logitech mouse in Hyprland devices")
-    write_accel_block(enabled, names)
-    errors = reload_hypr()
-    if errors:
-        fail(f"hyprland config error: {errors}")
+    try:
+        write_accel_block(enabled, names)
+    except OSError as exc:
+        fail(str(exc))
     cmd_status(serial)
 
 

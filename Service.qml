@@ -71,8 +71,14 @@ Item {
     return s === "true" || s === "on" || s === "yes" || s === "1"
   }
 
+  function capText(raw, maxChars) {
+    var text = String(raw || "")
+    if (text.length > maxChars) return text.substring(0, maxChars)
+    return text
+  }
+
   function applyStatus(raw) {
-    var text = String(raw || "").trim()
+    var text = capText(raw, 65536).trim()
     if (text === "") {
       lastError = "Empty helper output"
       return
@@ -150,7 +156,7 @@ Item {
   }
 
   function runHelper(args) {
-    var cmd = ["/usr/bin/timeout", "-s", "KILL", "8", "/usr/bin/python3", helperPath]
+    var cmd = ["/usr/bin/timeout", "-s", "KILL", "8", "/usr/bin/python3", "-I", helperPath]
     if (pinDevice && selectedSerial !== "") {
       cmd.push("--device")
       cmd.push(selectedSerial)
@@ -232,7 +238,13 @@ Item {
   function startListen() {
     if (listenProc.running) listenProc.running = false
     if (!connected || !hasButtons) return
-    listenProc.command = runHelper(["listen"])
+    var cmd = ["/usr/bin/timeout", "-s", "KILL", "21600", "/usr/bin/python3", "-I", helperPath]
+    if (pinDevice && selectedSerial !== "") {
+      cmd.push("--device")
+      cmd.push(selectedSerial)
+    }
+    cmd.push("listen")
+    listenProc.command = cmd
     listenProc.running = true
   }
 
@@ -258,8 +270,8 @@ Item {
     }
     onExited: function(exitCode) {
       root.refreshing = false
-      var stdout = String(statusOut.text || "")
-      var stderr = String(statusErr.text || "")
+      var stdout = root.capText(statusOut.text, 65536)
+      var stderr = root.capText(statusErr.text, 4096)
       if (exitCode === 0) root.applyStatus(stdout)
       else root.lastError = stderr || stdout || "Could not read mouse"
     }
@@ -278,8 +290,8 @@ Item {
       waitForEnd: true
     }
     onExited: function(exitCode) {
-      var stdout = String(actionOut.text || "")
-      var stderr = String(actionErr.text || "")
+      var stdout = root.capText(actionOut.text, 65536)
+      var stderr = root.capText(actionErr.text, 4096)
       if (exitCode === 0) {
         root.applyStatus(stdout)
         var cmd = actionProc.command || []
