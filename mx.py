@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import os
@@ -43,9 +44,77 @@ WANTED = (
 )
 
 
+MISSING_SOLAAR = (
+    "Solaar is not installed (missing logitech_receiver). "
+    "Install it with: omarchy pkg add solaar "
+    "(or your distro's solaar package). "
+    "Then reload udev or reconnect the mouse so /dev/hidraw* is user-accessible."
+)
+HIDRAW_DENIED = (
+    "Cannot open the mouse hidraw device (permission denied). "
+    "Solaar's udev rule adds uaccess for Logitech hidraw, including Bluetooth "
+    "(KERNELS==0005:046D:*). Reload udev and reconnect the mouse."
+)
+
+
 def fail(message: str, *, code: int = 1) -> None:
     print(json.dumps({"ok": False, "error": message}), flush=True)
     raise SystemExit(code)
+
+
+def require_logitech_receiver() -> None:
+    try:
+        from logitech_receiver import base  # noqa: F401
+    except ImportError:
+        fail(MISSING_SOLAAR)
+
+
+def _hidraw_uevent(name: str) -> tuple[str, str]:
+    try:
+        text = Path(f"/sys/class/hidraw/{name}/device/uevent").read_text(errors="replace")
+    except OSError:
+        return "", ""
+    hid_id = ""
+    hid_name = ""
+    for line in text.splitlines():
+        if line.startswith("HID_ID="):
+            hid_id = line.split("=", 1)[1].upper()
+        elif line.startswith("HID_NAME="):
+            hid_name = line.split("=", 1)[1]
+    return hid_id, hid_name
+
+
+def _is_logitech_hidraw(hid_id: str, hid_name: str) -> bool:
+    parts = hid_id.split(":")
+    vendor = parts[1][-4:] if len(parts) >= 2 else ""
+    return vendor == "046D" or "logitech" in hid_name.lower()
+
+
+def logitech_hidraw_denied() -> bool:
+    """True when a Logitech hidraw node exists but this user cannot open it."""
+    try:
+        names = os.listdir("/dev")
+    except OSError:
+        return False
+    for name in names:
+        if not name.startswith("hidraw") or not name[6:].isdigit():
+            continue
+        hid_id, hid_name = _hidraw_uevent(name)
+        if not _is_logitech_hidraw(hid_id, hid_name):
+            continue
+        try:
+            fd = os.open(f"/dev/{name}", os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW)
+        except OSError as exc:
+            if exc.errno == errno.EACCES:
+                return True
+            continue
+        os.close(fd)
+    return False
+
+
+def explain_missing_mouse() -> None:
+    if logitech_hidraw_denied():
+        fail(HIDRAW_DENIED)
 
 
 def emit(payload: dict[str, Any]) -> None:
@@ -352,21 +421,38 @@ FAMILY_IDS: dict[str, str] = {
 
 
 def iter_devices() -> list[Any]:
+    require_logitech_receiver()
     from logitech_receiver import base
     from logitech_receiver import device as device_mod
     from logitech_receiver import receiver as receiver_mod
 
     found: list[Any] = []
+    denied = False
     for info in base.receivers_and_devices():
         try:
             if info.isDevice:
                 handle = device_mod.create_device(base, info)
             else:
                 handle = receiver_mod.create_receiver(base, info)
+        except OSError as exc:
+            if getattr(exc, "errno", None) == errno.EACCES:
+                denied = True
+                continue
+            logger.exception("opening %s", getattr(info, "path", "?"))
+            continue
         except Exception:
             logger.exception("opening %s", getattr(info, "path", "?"))
             continue
         if handle is None:
+            path = getattr(info, "path", None)
+            if isinstance(path, str) and path.startswith("/dev/hidraw"):
+                try:
+                    probe = os.open(path, os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW)
+                except OSError as exc:
+                    if exc.errno == errno.EACCES:
+                        denied = True
+                else:
+                    os.close(probe)
             continue
         if getattr(handle, "isDevice", False):
             found.append(handle)
@@ -377,6 +463,8 @@ def iter_devices() -> list[Any]:
                     found.append(child)
         except Exception:
             logger.exception("listing paired devices")
+    if not found and (denied or logitech_hidraw_denied()):
+        fail(HIDRAW_DENIED)
     return found
 
 
@@ -771,7 +859,10 @@ def cmd_bind(button: str, action: str, serial: str | None) -> None:
         fail(f"unknown action '{action}'")
     devices = iter_devices()
     mouse = pick_mouse(devices, serial)
-    if mouse is None or not mouse.ping():
+    if mouse is None:
+        explain_missing_mouse()
+        fail("mouse is offline")
+    if not mouse.ping():
         fail("mouse is offline")
     remap = find_setting(mouse, "reprogrammable-keys")
     divert = find_setting(mouse, "divert-keys")
@@ -836,7 +927,10 @@ def cmd_listen(serial: str | None) -> None:
     deadline = time.monotonic() + LISTEN_MAX_SEC
     devices = iter_devices()
     mouse = pick_mouse(devices, serial)
-    if mouse is None or not mouse.ping():
+    if mouse is None:
+        explain_missing_mouse()
+        fail("mouse is offline")
+    if not mouse.ping():
         fail("mouse is offline")
     remap = find_setting(mouse, "reprogrammable-keys")
     divert = find_setting(mouse, "divert-keys")
@@ -1005,6 +1099,7 @@ def cmd_status(serial: str | None) -> None:
     devices = iter_devices()
     mouse = pick_mouse(devices, serial)
     if mouse is None:
+        explain_missing_mouse()
         emit(
             {
                 "ok": True,
@@ -1025,7 +1120,10 @@ def cmd_set(name: str, value: str, serial: str | None) -> None:
 
     devices = iter_devices()
     mouse = pick_mouse(devices, serial)
-    if mouse is None or not mouse.ping():
+    if mouse is None:
+        explain_missing_mouse()
+        fail("mouse is offline")
+    if not mouse.ping():
         fail("mouse is offline")
     setting = settings_templates.check_feature_setting(mouse, name)
     if setting is None:
@@ -1049,7 +1147,10 @@ def cmd_play(waveform: str, serial: str | None) -> None:
 
     devices = iter_devices()
     mouse = pick_mouse(devices, serial)
-    if mouse is None or not mouse.ping():
+    if mouse is None:
+        explain_missing_mouse()
+        fail("mouse is offline")
+    if not mouse.ping():
         fail("mouse is offline")
     setting = settings_templates.check_feature_setting(mouse, "haptic-play")
     if setting is None:
@@ -1088,6 +1189,7 @@ def main(argv: list[str]) -> None:
         )
     action = args[0]
     try:
+        require_logitech_receiver()
         if action == "status":
             cmd_status(serial)
         elif action == "set":
@@ -1112,6 +1214,24 @@ def main(argv: list[str]) -> None:
             fail(f"unknown action '{action}'")
     except SystemExit:
         raise
+    except ImportError as exc:
+        name = getattr(exc, "name", "") or ""
+        text = str(exc)
+        if (
+            name == "logitech_receiver"
+            or name.startswith("logitech_receiver.")
+            or name == "solaar"
+            or name.startswith("solaar.")
+            or "logitech_receiver" in text
+        ):
+            fail(MISSING_SOLAAR)
+        logger.exception("mx helper failed")
+        fail(str(exc))
+    except OSError as exc:
+        if getattr(exc, "errno", None) == errno.EACCES:
+            fail(HIDRAW_DENIED)
+        logger.exception("mx helper failed")
+        fail(str(exc))
     except Exception as occ:
         logger.exception("mx helper failed")
         fail(str(occ))
