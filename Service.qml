@@ -344,8 +344,13 @@ Item {
     }
     onExited: function(exitCode) {
       root.refreshing = false
-      if (exitCode === 0) root.applyStatus(root.statusLine)
-      else root.lastError = root.statusErrLine || root.statusLine || "Could not read mouse"
+      var line = (root.statusLine || "").trim()
+      if (exitCode === 0 || line.charAt(0) === "{")
+        root.applyStatus(root.statusLine)
+      else {
+        root.lastError = root.statusErrLine || root.statusLine || "Could not read mouse"
+        root.initialized = true
+      }
     }
   }
 
@@ -370,9 +375,21 @@ Item {
         for (var i = 0; i < cmd.length; i++) {
           if (cmd[i] === "bind") { root.startListen(); break }
         }
-      } else {
-        root.lastError = root.actionErrLine || root.actionLine || "Mouse command failed"
+        return
       }
+      var line = (root.actionLine || "").trim()
+      if (line.charAt(0) === "{") {
+        try {
+          var parsed = JSON.parse(line)
+          if (parsed && parsed.error) {
+            root.lastError = String(parsed.error)
+            root.initialized = true
+            return
+          }
+        } catch (e) {}
+      }
+      root.lastError = root.actionErrLine || root.actionLine || "Mouse command failed"
+      root.initialized = true
     }
   }
 

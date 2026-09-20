@@ -23,7 +23,35 @@ No sudo or pkexec is required.
 
 ```bash
 omarchy plugin add https://github.com/Ormus-Solutions/omalogimouse.git --enable
+omarchy pkg add solaar
 ```
+
+`omarchy plugin add` only clones and enables the plugin. It does not install
+Solaar. Without Solaar, `python3 -I mx.py status` fails with a missing
+`logitech_receiver` module and the bar stays offline.
+
+Solaar is required for two things: the `logitech_receiver` Python library
+(HID++), and the udev rule that grants `uaccess` on Logitech hidraw devices,
+including Bluetooth (`KERNELS==0005:046D:*`). The library is required; the
+Solaar GUI and daemon are not, and must not run next to this plugin.
+
+After installing Solaar, reconnect the mouse, or reload udev:
+
+```bash
+udevadm control --reload-rules
+udevadm trigger --subsystem-match=hidraw --action=add
+```
+
+Arch's `solaar` package installs `/etc/xdg/autostart/solaar.desktop`
+(`solaar --window=hide`). Mask it:
+
+```bash
+mkdir -p ~/.config/autostart
+printf '%s\n' '[Desktop Entry]' 'Hidden=true' > ~/.config/autostart/solaar.desktop
+```
+
+`install.sh` in this repo runs `omarchy pkg add solaar` when the `omarchy` CLI
+is present. `omarchy plugin add` does not run it automatically.
 
 The widget lands on the right of the bar. Move it with:
 
@@ -64,7 +92,7 @@ HID++ owner at a time.
 
 - Omarchy Quattro (`omarchy-shell`, `omarchy` CLI, `hyprctl`)
 - `python3`
-- `solaar` (provides the `logitech_receiver` library; the Solaar GUI is unused)
+- `solaar` (provides `logitech_receiver` and Logitech hidraw udev rules; the Solaar GUI is unused)
 - A paired MX Master on a Bolt / Unifying receiver or Bluetooth
 
 ## What it executes
