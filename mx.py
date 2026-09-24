@@ -257,6 +257,7 @@ def _cap_stderr() -> None:
 def run_tool(exe: VerifiedExec, extra: list[str], *, timeout: int = PROC_TIMEOUT_SEC) -> str:
     proc = subprocess.Popen(
         exe.argv(extra),
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         env=_closed_env(),
@@ -614,6 +615,14 @@ def software_actions() -> dict[str, tuple[VerifiedExec, list[str]]]:
     shot = verified_user_exec("screenshot-region-clipboard")
     if shot is not None:
         actions["screenshot"] = (shot, [])
+    else:
+        # /usr/bin/omarchy finds subcommands next to BASH_SOURCE, which is
+        # /proc/self/fd/N under VerifiedExec, so run the capture script itself.
+        try:
+            capture = VerifiedExec("/usr/bin/omarchy-capture-screenshot", owner=0)
+            actions["screenshot"] = (capture, ["region"])
+        except OSError:
+            pass
     return actions
 
 
@@ -769,6 +778,8 @@ def cmd_bind(button: str, action: str, serial: str | None) -> None:
     known = {row["value"] for row in ACTION_CATALOG}
     if action not in known:
         fail(f"unknown action '{action}'")
+    if action != "default" and action not in HW_ACTIONS and action not in SOFTWARE_ACTIONS:
+        fail(f"action '{action}' is not available on this system")
     devices = iter_devices()
     mouse = pick_mouse(devices, serial)
     if mouse is None or not mouse.ping():
@@ -814,9 +825,12 @@ def fire_action(action: str) -> None:
         return
     exe, extra = spec
     try:
+        # The listener's stdin is an open Quickshell pipe. slurp reads
+        # boxes from a non-tty stdin and would block on it forever.
         subprocess.Popen(
             exe.argv(extra),
             env=_closed_env(),
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             pass_fds=(exe.fd,),

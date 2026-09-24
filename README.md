@@ -78,10 +78,13 @@ shell string. Nothing elevates privileges.
   toggle; output is time- and byte-capped
 - `/usr/bin/omarchy` and `/usr/bin/omarchy-shell` — only for Keybinds actions
   you pick (menu, volume, Exposé, play/pause)
+- `/usr/bin/omarchy-capture-screenshot region` — only for the Screenshot region
+  Keybinds action
 - Optional `~/.local/bin/screenshot-region-clipboard` if it is a user-owned
-  regular file (no symlink)
+  regular file (no symlink); runs instead of `omarchy-capture-screenshot region`
 
 Child processes use a closed environment (`PATH=/usr/bin:/bin`, no `PYTHONPATH`).
+Commands the helper starts (hyprctl, Keybinds actions) get `/dev/null` as stdin.
 Config and binds writes are no-follow, size-capped, and replaced atomically.
 A failed Hyprland reload rolls `input.lua` back.
 
