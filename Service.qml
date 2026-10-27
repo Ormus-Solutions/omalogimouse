@@ -175,6 +175,7 @@ Item {
     "XDG_SESSION_TYPE": Quickshell.env("XDG_SESSION_TYPE") || "",
     "XDG_CURRENT_DESKTOP": Quickshell.env("XDG_CURRENT_DESKTOP") || "",
     "DBUS_SESSION_BUS_ADDRESS": Quickshell.env("DBUS_SESSION_BUS_ADDRESS") || "",
+    "OMARCHY_PATH": Quickshell.env("OMARCHY_PATH") || "",
     "LANG": Quickshell.env("LANG") || "C",
     "PYTHONDONTWRITEBYTECODE": "1"
   })
