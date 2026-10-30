@@ -176,6 +176,7 @@ Item {
     "XDG_CURRENT_DESKTOP": Quickshell.env("XDG_CURRENT_DESKTOP") || "",
     "DBUS_SESSION_BUS_ADDRESS": Quickshell.env("DBUS_SESSION_BUS_ADDRESS") || "",
     "LANG": Quickshell.env("LANG") || "C",
+    "OMARCHY_PATH": Quickshell.env("OMARCHY_PATH") || "/usr/share/omarchy",
     "PYTHONDONTWRITEBYTECODE": "1"
   })
 

@@ -86,6 +86,7 @@ def _closed_env() -> dict[str, str]:
         "DBUS_SESSION_BUS_ADDRESS",
         "LANG",
         "LC_ALL",
+        "OMARCHY_PATH",
     )
     env = {key: os.environ[key] for key in keep if key in os.environ}
     env["PATH"] = "/usr/bin:/bin"
@@ -98,6 +99,7 @@ class VerifiedExec:
     checked inode is the one that executes."""
 
     def __init__(self, abs_path: str, *, owner: int) -> None:
+        self.abs_path = abs_path
         self.fd = os.open(abs_path, os.O_RDONLY | os.O_NOFOLLOW)
         try:
             st = os.fstat(self.fd)
@@ -107,11 +109,16 @@ class VerifiedExec:
                 raise OSError(f"{abs_path} is group/other-writable")
             if not (st.st_mode & stat.S_IXUSR):
                 raise OSError(f"{abs_path} is not executable")
+            # Scripts such as omarchy locate their siblings from BASH_SOURCE,
+            # which resolves to /proc/self when run through the fd.
+            self.is_script = os.pread(self.fd, 2, 0) == b"#!"
         except OSError:
             os.close(self.fd)
             raise
 
     def argv(self, extra: list[str]) -> list[str]:
+        if self.is_script:
+            return [self.abs_path, *extra]
         return [f"/proc/self/fd/{self.fd}", *extra]
 
 
@@ -448,16 +455,20 @@ def pick_mouse(devices: list[Any], serial: str | None = None) -> Any | None:
     members = family_members(devices)
     if not members:
         return None
+    # Ping before matching: a Bluetooth handle has no serial until it answers,
+    # and the same mouse paired over both a receiver and Bluetooth reports one
+    # serial twice, so rank the matches instead of taking the first.
+    pinged = {id(dev): bool(dev.ping()) for dev in members}
     if serial:
         wanted = serial.lower()
-        for dev in members:
-            if device_serial(dev).lower() == wanted:
-                return dev
+        matches = [dev for dev in members if device_serial(dev).lower() == wanted]
+        if matches:
+            members = matches
 
     ranked: list[tuple[int, int, str, Any]] = []
     for dev in members:
         label = family_label(dev) or ""
-        online = 1 if dev.ping() else 0
+        online = 1 if pinged[id(dev)] else 0
         gen = generation_of(label)
         gen_rank = {"4": 4, "3s": 3, "3": 2, "2s": 1, "1": 0}.get(gen, 0)
         ranked.append((online, gen_rank, label, dev))
@@ -602,8 +613,8 @@ HW_BY_LABEL["haptic"] = "haptic-hw"
 
 def software_actions() -> dict[str, tuple[VerifiedExec, list[str]]]:
     actions: dict[str, tuple[VerifiedExec, list[str]]] = {
-        "workspace-next": (HYPRCTL, ["dispatch", "workspace", "e+1"]),
-        "workspace-prev": (HYPRCTL, ["dispatch", "workspace", "e-1"]),
+        "workspace-next": (HYPRCTL, ["dispatch", 'hl.dsp.focus({ workspace = "e+1" })']),
+        "workspace-prev": (HYPRCTL, ["dispatch", 'hl.dsp.focus({ workspace = "e-1" })']),
         "menu": (OMARCHY, ["menu", "summon", "root"]),
         "expose": (OMARCHY_SHELL, ["expose", "toggle"]),
         "volume-up": (OMARCHY, ["audio", "output", "volume", "raise"]),
